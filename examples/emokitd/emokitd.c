@@ -15,11 +15,14 @@
 
 #include "emokitd.h"
 
+const char *fifo_path = "emokitd";
+
 sigset_t mask;
 
 typedef struct emokit_device emokit_device;
 
 void fatal_err(const char *msg) {
+	printf("%s\n", msg);
 	syslog(LOG_INFO, msg);
 	exit(1);
 }
@@ -38,7 +41,7 @@ void *thr_signal_handler(void *arg) {
 		switch (sig) {
 		case SIGTERM:
 			syslog(LOG_INFO, "Caught SIGTERM. Exiting.");
-			remove(FIFO_PATH);
+			remove(fifo_path);
 			exit(0);
 			
 		case SIGPIPE:
@@ -117,7 +120,7 @@ void daemonize() {
 	fd2 = dup(fd0);
 
 	openlog(DAEMON_IDENT, LOG_CONS, LOG_DAEMON);
-	syslog(LOG_INFO, "emokitd running; decrypted EEG data will be written to %s.", FIFO_PATH);
+	syslog(LOG_INFO, "emokitd running; decrypted EEG data will be written to %s.", fifo_path);
 
 }
 
@@ -135,10 +138,31 @@ void dbg_stream(emokit_device *eeg) {
 	}
 }
 
+void replay_loop(const char *trace_path) {
+	int i;
+	FILE *emokitd_fifo;
+	FILE *trace_fp;
+
+	trace_fp = fopen(trace_path, "r");
+	if (!trace_fp) {
+		fatal_err("cannot open trace file for replaying.");
+	}
+	emokitd_fifo = fopen(fifo_path, "wb");
+	if (!emokitd_fifo) {
+		fatal_err("cannot open FIFO for writing.");
+	}
+	for (;;) {
+		unsigned char frame[32];
+		if (fread(frame, 1, EMOKIT_PKT_SIZE, trace_fp) > 0) {
+			fwrite(frame, 1, EMOKIT_PKT_SIZE, emokitd_fifo);
+		}
+	}
+}
+
 void decrypt_loop(emokit_device *eeg) {
 	int i;
 	FILE *emokitd_fifo;
-	emokitd_fifo = fopen(FIFO_PATH, "wb");
+	emokitd_fifo = fopen(fifo_path, "wb");
 	if (!emokitd_fifo) {
 		fatal_err("cannot open FIFO for writing.");
 	}
@@ -158,21 +182,48 @@ int main(int argc, char **argv) {
 	pthread_t tid;
 	struct sigaction sa;
 	emokit_device *eeg;
-	if (!DEBUG) {
+	const char *trace_path = NULL;
+	int ch, debug = 0;
+
+	while ((ch = getopt(argc, argv, "do:t:")) != -1) {
+		switch(ch) {
+			case 'd':
+				debug = 1;
+				break;
+			case 'o':
+				fifo_path = optarg;
+				break;
+			case 't':
+				trace_path = optarg;
+				break;
+			default:
+				fatal_err("invalid options.");
+		}
+	}
+
+	if (!debug) {
 		daemonize();
 		if (daemon_running()) {
 			syslog(LOG_INFO, "Looks like emokitd is already running.\n");
 			exit(1);
 		}
 	}
-	eeg = emokit_create();
-	if (emokit_open(eeg, EMOKIT_VID, EMOKIT_PID, 0) != 0) {
-		fatal_err("cannot access device. Are you root?");
-		return 1;
-	}
 
-	if ((access(FIFO_PATH, W_OK) < 0) && mkfifo(FIFO_PATH, 0666) != 0) {
-		fatal_err("cannot create FIFO.");
+	if (trace_path) {
+		// replay mode
+
+	} else {
+		// 'real' mode
+		eeg = emokit_create();
+		if (emokit_open(eeg, EMOKIT_VID, EMOKIT_PID, 0) != 0) {
+			fatal_err("cannot access device. Are you root?");
+			return 1;
+		}
+
+		if ((access(fifo_path, W_OK) < 0) &&
+		      mkfifo(fifo_path, 0666) != 0) {
+			fatal_err("cannot create FIFO.");
+		}
 	}
 	sa.sa_handler = SIG_DFL;
 	sigemptyset(&sa.sa_mask);
@@ -183,8 +234,11 @@ int main(int argc, char **argv) {
 		fatal_err("SIG_BLOCK error.");
 	if (pthread_create(&tid, NULL, thr_signal_handler, 0) != 0) 
 		fatal_err("cannot create thread.");
-	if (DEBUG)
+	if (debug)
 		printf("Entering decrypt loop...\n");
-	decrypt_loop(eeg);
+	if (trace_path)
+		replay_loop(trace_path);
+	else
+		decrypt_loop(eeg);
 	return 0;
 }
